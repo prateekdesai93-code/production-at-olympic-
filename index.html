@@ -561,6 +561,8 @@
       <span class="verify-badge" id="verify-badge"></span>
     </div>
 
+    <div class="alert alert-warn" id="unmatched-warning" style="margin-bottom:20px; display:none;"></div>
+
     <div class="stats-grid" id="stats-grid"></div>
 
     <div class="section-card">
@@ -743,16 +745,33 @@ function splitSize(fullName) {
   return [base, size];
 }
 function isoDate(ddmmyyyy) {
+  if (!ddmmyyyy || typeof ddmmyyyy !== "string") return null;
   const parts = ddmmyyyy.split("/");
+  if (parts.length !== 3) return null;
   return parts[2] + "-" + parts[1] + "-" + parts[0];
 }
 
+const UNKNOWN_BATCH = "BATCH/OUT/UNKNOWN";
+const UNKNOWN_DATE = "unknown-date";
+
 function aggregate(rawItems, transferDate, transferBatch) {
   const byDateBatch = new Map();
+  const unmatchedItems = [];
   for (const [name, qty, ref] of rawItems) {
     const [base, size] = splitSize(name);
-    const date = isoDate(transferDate[ref]);
-    const batch = transferBatch[ref];
+    let date = isoDate(transferDate[ref]);
+    let batch = transferBatch[ref];
+    if (date === null || !batch) {
+      // The product line's transfer ref never showed up in this file's
+      // sequence/status table (different status word, unusual date/time
+      // format, or a line the extractor mis-grouped) — don't crash the
+      // whole report over one unmatched line. Bucket it under an explicit
+      // "unknown" batch/date so it still appears (and is flagged) rather
+      // than silently vanishing or bringing down every other line.
+      unmatchedItems.push({ name, qty, ref });
+      date = date || UNKNOWN_DATE;
+      batch = batch || UNKNOWN_BATCH;
+    }
     const key = JSON.stringify([date, batch, base, size]);
     byDateBatch.set(key, (byDateBatch.get(key) || 0) + qty);
   }
@@ -798,12 +817,15 @@ function aggregate(rawItems, transferDate, transferBatch) {
     byBatchRows.push({ Batch: batch, Product: product, Size: size, Quantity: qty });
   }
 
-  const dispatchDates = [...new Set(Object.values(transferDate).map(isoDate))].sort();
-  const batches = [...new Set(Object.values(transferBatch).filter(Boolean))].sort(
+  const dispatchDates = [...new Set(Object.values(transferDate).map(isoDate).filter(Boolean))].sort();
+  let batches = [...new Set(Object.values(transferBatch).filter(Boolean))].sort(
     (a, b) => batchSortKey(a) - batchSortKey(b)
   );
+  if (unmatchedItems.length && !batches.includes(UNKNOWN_BATCH)) {
+    batches = [...batches, UNKNOWN_BATCH];
+  }
 
-  return { finalRows, byBatchRows, dispatchDates, batches };
+  return { finalRows, byBatchRows, dispatchDates, batches, unmatchedItems };
 }
 
 function aggregateCategory(byBatchRows, predicate) {
@@ -1015,6 +1037,22 @@ function renderDashboard(result) {
       " batch(es) could not be auto-verified as outbound &mdash; check the source PDF";
   }
 
+  const unmatchedBox = document.getElementById("unmatched-warning");
+  if (agg.unmatchedItems && agg.unmatchedItems.length) {
+    const preview = agg.unmatchedItems.slice(0, 8)
+      .map((u) => escapeHtml(u.name) + " (qty " + numfmt(u.qty) + ")")
+      .join(", ");
+    const more = agg.unmatchedItems.length > 8 ? ", and " + (agg.unmatchedItems.length - 8) + " more" : "";
+    unmatchedBox.style.display = "block";
+    unmatchedBox.innerHTML = "&#9888; " + agg.unmatchedItems.length + " line item(s) couldn't be matched to a " +
+      "batch/dispatch date in the source PDF (its status row didn't look like the expected \"Ready DD/MM/YYYY " +
+      "HH:MM:SS AM/PM\" format). They're included below under batch <strong>#UNKNOWN</strong> so nothing is " +
+      "silently dropped, but please cross-check them against the source document: " + preview + more + ".";
+  } else {
+    unmatchedBox.style.display = "none";
+    unmatchedBox.innerHTML = "";
+  }
+
   renderStatCards(depts.sizeTotals);
 
   document.getElementById("putty-count").textContent = depts.puttyTableRows.length + " rows";
@@ -1037,6 +1075,10 @@ function renderDashboard(result) {
     " batch(es) in the source document(s) &mdash; nothing inbound is included.";
   if (depts.absentCategories.length) {
     note += " No " + depts.absentCategories.join(", ") + " line items appear in this batch set, so those rows are simply absent from Putty Department today.";
+  }
+  if (agg.unmatchedItems && agg.unmatchedItems.length) {
+    note += " " + agg.unmatchedItems.length + " line item(s) had no matching batch/date entry in the source " +
+      "PDF and are listed under batch #UNKNOWN above — verify those against the source document.";
   }
   document.getElementById("footer-note").innerHTML = note;
 
@@ -1170,6 +1212,15 @@ function exportPdf(result) {
     y = wrapText(
       doc,
       "No " + depts.absentCategories.join(", ") + " line items appear in this batch set, so those rows are simply absent from Putty Department today.",
+      marginX, y, pageWidth - marginX * 2, 3.8
+    );
+  }
+
+  if (agg.unmatchedItems && agg.unmatchedItems.length) {
+    y = wrapText(
+      doc,
+      agg.unmatchedItems.length + " line item(s) had no matching batch/date entry in the source PDF and are " +
+        "listed under batch #UNKNOWN above — verify those against the source document.",
       marginX, y, pageWidth - marginX * 2, 3.8
     );
   }
