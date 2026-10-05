@@ -631,51 +631,46 @@
     return false;
   }
 
+  // One uploaded file can hold MANY delivery notes back to back (e.g. a
+  // 21-page export with a dozen notes, each starting with its own
+  // "Delivery Note OP/OUT/#####" title, and a note can run over several
+  // pages with no title on the continuation pages). Lines are therefore
+  // assigned to the most recent title seen while walking the file in
+  // page/line order, and every delivery note becomes its own batch — each
+  // with its own Shipping Date — so the "Batch Out #" column lists all of
+  // them, not just the first.
   function parseDeliverySlipPages(pagesOfLines, sourceLabel) {
     const linesOut = [];
     const anomalies = [];
-
-    // The delivery note number is the file's single "batch" reference — it
-    // normally appears once, on page 1, but we scan every page just in
-    // case a very long delivery note repeats its own title.
-    let batchNum = null;
-    for (const lines of pagesOfLines) {
-      for (const raw of lines) {
-        const m = DS_TITLE_RE.exec(raw.trim());
-        if (m) { batchNum = m[1]; break; }
-      }
-      if (batchNum) break;
-    }
-
-    if (!batchNum) {
-      anomalies.push({
-        batch: null,
-        raw: '(file: ' + sourceLabel + ')',
-        page: 1,
-        qty: null,
-        transfer: null,
-        source: sourceLabel,
-        reason: 'Delivery Slip file has no "Delivery Note OP/OUT/#####" title line — could not determine its delivery/batch number, so no lines from this file were included',
-      });
-      return { lines: [], batchesMeta: {}, anomalies, ftIssues: [] };
-    }
-
-    const meta = { vehicle: null, category: null, dates: new Set(), sourceType: 'delivery-slip' };
+    const metaByBatch = {};
+    let currentBatch = null;
 
     pagesOfLines.forEach((lines, idx) => {
       const pageno = idx + 1;
-      const fullPageText = lines.join('\n');
-
-      let dm;
-      DATE_RE.lastIndex = 0;
-      while ((dm = DATE_RE.exec(fullPageText)) !== null) {
-        meta.dates.add(dm[1]);
-      }
 
       for (const raw of lines) {
         const s = raw.trim();
         if (!s) continue;
-        if (DS_TITLE_RE.test(s)) continue;
+
+        const tm = DS_TITLE_RE.exec(s);
+        if (tm) {
+          currentBatch = tm[1];
+          if (!metaByBatch[currentBatch]) {
+            metaByBatch[currentBatch] = { vehicle: null, category: null, dates: new Set(), sourceType: 'delivery-slip' };
+          }
+          continue;
+        }
+
+        // Shipping Date sits on the line right after the title block's
+        // "Order / Shipping Date / Total Weight" headings — attach any
+        // timestamp to the note currently being read.
+        if (currentBatch) {
+          let dm;
+          DATE_RE.lastIndex = 0;
+          while ((dm = DATE_RE.exec(s)) !== null) {
+            metaByBatch[currentBatch].dates.add(dm[1]);
+          }
+        }
 
         // Product rows are the only lines carrying "Each" twice (once for
         // Ordered, once for Delivered) — everything else (addresses,
@@ -684,15 +679,23 @@
         const eachCount = (s.match(/\bEach\b/g) || []).length;
         if (eachCount < 2) continue;
 
+        if (!currentBatch) {
+          anomalies.push({
+            batch: null, raw: s, page: pageno, qty: null, transfer: null, source: sourceLabel,
+            reason: 'product row found before any "Delivery Note OP/OUT/#####" title — could not tell which delivery it belongs to',
+          });
+          continue;
+        }
+
         const bm = DS_BRACKET_RE.exec(s);
         if (bm) {
           linesOut.push({
-            batch: batchNum,
+            batch: currentBatch,
             code: bm[1],
             name: bm[2].trim(),
             qty: parseFloat(bm[3]),
             delivered: parseFloat(bm[4]),
-            transfer: 'OP/OUT/' + batchNum,
+            transfer: 'OP/OUT/' + currentBatch,
             page: pageno,
             raw: s,
             source: sourceLabel,
@@ -713,12 +716,12 @@
             name = rest;
           }
           linesOut.push({
-            batch: batchNum,
+            batch: currentBatch,
             code,
             name,
             qty: parseFloat(pm[2]),
             delivered: parseFloat(pm[3]),
-            transfer: 'OP/OUT/' + batchNum,
+            transfer: 'OP/OUT/' + currentBatch,
             page: pageno,
             raw: s,
             source: sourceLabel,
@@ -727,7 +730,7 @@
         }
 
         anomalies.push({
-          batch: batchNum,
+          batch: currentBatch,
           raw: s,
           page: pageno,
           qty: null,
@@ -738,8 +741,22 @@
       }
     });
 
+    if (!Object.keys(metaByBatch).length) {
+      anomalies.push({
+        batch: null,
+        raw: '(file: ' + sourceLabel + ')',
+        page: 1,
+        qty: null,
+        transfer: null,
+        source: sourceLabel,
+        reason: 'Delivery Slip file has no "Delivery Note OP/OUT/#####" title line — could not determine its delivery/batch number, so no lines from this file were included',
+      });
+    }
+
     const batchesMeta = {};
-    batchesMeta[batchNum] = { vehicle: meta.vehicle, category: meta.category, dates: Array.from(meta.dates).sort(), sourceType: meta.sourceType };
+    for (const [b, m] of Object.entries(metaByBatch)) {
+      batchesMeta[b] = { vehicle: m.vehicle, category: m.category, dates: Array.from(m.dates).sort(), sourceType: m.sourceType };
+    }
 
     return { lines: linesOut, batchesMeta, anomalies, ftIssues: [] };
   }
